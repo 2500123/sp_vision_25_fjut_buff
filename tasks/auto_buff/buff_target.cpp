@@ -1,5 +1,7 @@
 #include "buff_target.hpp"
 
+#include <cmath>
+
 namespace auto_buff
 {
 ///voter
@@ -220,7 +222,8 @@ void SmallTarget::update(double nowtime, const PowerRune & p)
   if (voter.clockwise() * ekf_.x[6] < 0) ekf_.x[6] *= -1;  // spd
 
   // 预测下一个状态
-  predict(nowtime - lasttime_);
+  const double dt = std::max(0.0, nowtime - lasttime_);
+  if (dt > 0.0) predict(dt);
 
   // [R_yaw]     angle0
   // [R_pitch]   angle1
@@ -363,7 +366,7 @@ Eigen::MatrixXd SmallTarget::h_jacobian() const
 
 /// BigTarget
 
-BigTarget::BigTarget() : Target(), spd_fitter_(100, 0.5, 1.884, 2.000) {}
+BigTarget::BigTarget() : Target(), spd_fitter_(100, 0.5, 1.884, 2.000), fit_spd_(2.09) {}
 
 void BigTarget::get_target(
   const std::optional<PowerRune> & p, std::chrono::steady_clock::time_point & timestamp)
@@ -421,11 +424,13 @@ void BigTarget::get_target(
 void BigTarget::predict(double dt)
 {
   // 预测下一个状态
-  double spd = fit_spd_;
+  dt = std::max(0.0, dt);
+  double spd = std::isfinite(fit_spd_) ? fit_spd_ : 2.09;
   // double spd = ekf_.x[6];
   double a = ekf_.x[7];
   double w = ekf_.x[8];
   double fi = ekf_.x[9];
+  if (!std::isfinite(w) || std::abs(w) < 1e-6) w = (w >= 0.0 ? 1e-6 : -1e-6);
   double t = lasttime_ + dt;
   // clang-format off
   A_ << 1.0,  dt, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,//R_yaw
@@ -575,7 +580,8 @@ void BigTarget::update(double nowtime, const PowerRune & p)
   auto anglelast = ekf_.x[5];  ///
 
   // 预测下一个状态
-  predict(nowtime - lasttime_);
+  const double dt = std::max(0.0, nowtime - lasttime_);
+  if (dt > 0.0) predict(dt);
 
   // [R_yaw]     angle0
   // [R_pitch]   angle1
@@ -667,7 +673,7 @@ void BigTarget::update(double nowtime, const PowerRune & p)
     nowtime, spd_fitter_.best_result_.A, spd_fitter_.best_result_.omega,
     spd_fitter_.best_result_.phi, spd_fitter_.best_result_.C);
 
-  spd = voter.clockwise() * (ekf_.x[5] - anglelast) / (nowtime - lasttime_);  // 仅供调试
+  spd = (dt > 1e-6) ? (voter.clockwise() * (ekf_.x[5] - anglelast) / dt) : 0.0;  // 仅供调试
   spd = fit_spd_;
   if (std::abs(spd) > 4) spd = 0;
 

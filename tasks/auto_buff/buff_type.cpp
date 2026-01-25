@@ -36,11 +36,21 @@ PowerRune::PowerRune(
   auto choose_nearest_last_target = [&](const cv::Point2f & last_target_center) {
     auto target_it = ts.begin();
     float min_distance = cv::norm(ts[0].center - last_target_center);
+    const float tie_eps_px = 1.0f;
     for (auto it = ts.begin(); it != ts.end(); ++it) {
       float distance = cv::norm(it->center - last_target_center);
-      if (distance < min_distance) {
+      if (distance < min_distance - tie_eps_px) {
         min_distance = distance;
         target_it = it;
+      } else if (std::abs(distance - min_distance) <= tie_eps_px) {
+        // Tie-break deterministically so target doesn't flip when detection order changes.
+        const double a_new = atan_angle(it->center);
+        const double a_old = atan_angle(target_it->center);
+        if (a_new < a_old - 1e-6) {
+          target_it = it;
+        } else if (std::abs(a_new - a_old) <= 1e-6 && it->center.x < target_it->center.x) {
+          target_it = it;
+        }
       }
     }
     target_it->type = _target;

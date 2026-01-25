@@ -4,6 +4,7 @@
 #include <Eigen/Geometry>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -74,6 +75,7 @@ public:
   GimbalState state() const;
   std::string str(GimbalMode mode) const;
   Eigen::Quaterniond q(std::chrono::steady_clock::time_point t);
+  double q_age_ms(std::chrono::steady_clock::time_point now) const;
 
   void send(
     bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel,
@@ -87,6 +89,16 @@ private:
   std::thread thread_;
   std::atomic<bool> quit_ = false;
   mutable std::mutex mutex_;
+  mutable std::mutex tx_mutex_;
+
+  // Cache the latest quaternion samples so q(t) can interpolate/fallback without blocking.
+  mutable std::mutex q_mutex_;
+  Eigen::Quaterniond last_q_{1.0, 0.0, 0.0, 0.0};
+  std::chrono::steady_clock::time_point last_q_time_{std::chrono::steady_clock::time_point::min()};
+  Eigen::Quaterniond prev_q_{1.0, 0.0, 0.0, 0.0};
+  std::chrono::steady_clock::time_point prev_q_time_{std::chrono::steady_clock::time_point::min()};
+  bool has_last_q_{false};
+  bool has_prev_q_{false};
 
   GimbalToVision rx_data_;
   VisionToGimbal tx_data_;

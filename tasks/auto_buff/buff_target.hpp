@@ -110,7 +110,7 @@ private:
 
   tools::RansacSineFitter spd_fitter_;
 
-  double fit_spd_;
+  double fit_spd_ = 2.09;
 };
 
 }  // namespace auto_buff

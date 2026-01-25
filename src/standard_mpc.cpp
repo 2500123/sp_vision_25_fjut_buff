@@ -28,6 +28,11 @@ const std::string keys =
 
 using namespace std::chrono_literals;
 
+namespace
+{
+constexpr double kMaxQAgeMs = 50.0;  // 姿态超过该年龄则视为“过旧”，不发控制
+}
+
 int main(int argc, char * argv[])
 {
   cv::CommandLineParser cli(argc, argv, keys);
@@ -72,7 +77,7 @@ int main(int argc, char * argv[])
     uint16_t last_bullet_count = 0;
 
     while (!quit) {
-      if (!target_queue.empty() && mode == io::GimbalMode::AUTO_AIM) {
+      if (mode == io::GimbalMode::AUTO_AIM) {
         auto target = target_queue.front();
         auto gs = gimbal.state();
         auto plan = planner.plan(target, gs.bullet_speed);
@@ -96,9 +101,29 @@ int main(int argc, char * argv[])
     }
 
     camera.read(img, t);
+    if (img.empty()) {
+      continue;
+    }
     auto q = gimbal.q(t);
+    const double q_age_ms = gimbal.q_age_ms(std::chrono::steady_clock::now());
     auto gs = gimbal.state();
     recorder.record(img, q, t);
+
+    // 姿态过旧时：允许继续跑(不阻塞)，但不产出控制/目标，避免模式切换瞬间把云台拉飞。
+    if (q_age_ms > kMaxQAgeMs) {
+      static auto last_warn = std::chrono::steady_clock::time_point::min();
+      auto now = std::chrono::steady_clock::now();
+      if (now - last_warn > 1s) {
+        tools::logger()->warn("[standard_mpc] Stale gimbal q: {:.1f} ms > {:.1f} ms, skip control.", q_age_ms, kMaxQAgeMs);
+        last_warn = now;
+      }
+      if (mode.load() == io::GimbalMode::AUTO_AIM) {
+        target_queue.push(std::nullopt);
+      }
+      gimbal.send(false, false, 0, 0, 0, 0, 0, 0);
+      continue;
+    }
+
     solver.set_R_gimbal2world(q);
 
     /// 自瞄

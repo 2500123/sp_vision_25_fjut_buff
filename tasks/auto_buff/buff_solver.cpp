@@ -1,4 +1,7 @@
 #include "buff_solver.hpp"
+
+#include "tools/logger.hpp"
+
 namespace auto_buff
 {
 cv::Matx33f Solver::rotation_matrix(double angle) const
@@ -69,6 +72,14 @@ void Solver::solve(std::optional<PowerRune> & ps) const
   // }
   // image_points.emplace_back(p.r_center);  //r_center
   // object_points.emplace_back(cv::Point3f(0, 0, 0));
+  if (p.fanblades.empty() || p.target().points.size() < 4) {
+    tools::logger()->warn(
+      "[Solver] Invalid target keypoints: fanblades={}, points={}", p.fanblades.size(),
+      p.fanblades.empty() ? 0U : p.target().points.size());
+    ps = std::nullopt;
+    return;
+  }
+
   std::vector<cv::Point2f> image_points = p.target().points;
   // image_points.emplace_back(p.target().center);
   image_points.emplace_back(p.r_center);

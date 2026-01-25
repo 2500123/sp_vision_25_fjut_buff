@@ -1,13 +1,60 @@
 #include "yolo11_buff.hpp"
 
-const double ConfidenceThreshold = 0.3f;
-const double IouThreshold = 0.4f;
+namespace
+{
+constexpr float kDefaultConfidenceThreshold = 0.4f;
+constexpr float kDefaultIouThreshold = 0.8f;
+constexpr float kDefaultNmsCenterGateRatio = 0.25f;
+constexpr int kDefaultNmsTopK = 50;
+
+float rect_iou(const cv::Rect & a, const cv::Rect & b)
+{
+  const int x1 = std::max(a.x, b.x);
+  const int y1 = std::max(a.y, b.y);
+  const int x2 = std::min(a.x + a.width, b.x + b.width);
+  const int y2 = std::min(a.y + a.height, b.y + b.height);
+  const int inter_w = std::max(0, x2 - x1);
+  const int inter_h = std::max(0, y2 - y1);
+  const float inter = static_cast<float>(inter_w) * static_cast<float>(inter_h);
+  const float area_a = static_cast<float>(std::max(0, a.width)) * static_cast<float>(std::max(0, a.height));
+  const float area_b = static_cast<float>(std::max(0, b.width)) * static_cast<float>(std::max(0, b.height));
+  const float uni = area_a + area_b - inter;
+  return uni > 1e-6f ? inter / uni : 0.0f;
+}
+
+cv::Point2f rect_center(const cv::Rect & r)
+{
+  return {r.x + 0.5f * r.width, r.y + 0.5f * r.height};
+}
+
+cv::Rect clamp_rect(const cv::Rect & r, const cv::Size & size)
+{
+  const cv::Rect img_rect(0, 0, size.width, size.height);
+  return r & img_rect;
+}
+}  // namespace
 namespace auto_buff
 {
 YOLO11_BUFF::YOLO11_BUFF(const std::string & config)
 {
   auto yaml = YAML::LoadFile(config);
   std::string model_path = yaml["model"].as<std::string>();
+
+  confidence_threshold_ = yaml["confidence_threshold"]
+                            ? yaml["confidence_threshold"].as<float>()
+                            : kDefaultConfidenceThreshold;
+  iou_threshold_ = yaml["iou_threshold"] ? yaml["iou_threshold"].as<float>() : kDefaultIouThreshold;
+  nms_center_gate_ratio_ = yaml["nms_center_gate_ratio"]
+                             ? yaml["nms_center_gate_ratio"].as<float>()
+                             : kDefaultNmsCenterGateRatio;
+  nms_top_k_ = yaml["nms_top_k"] ? yaml["nms_top_k"].as<int>() : kDefaultNmsTopK;
+  nms_debug_ = yaml["nms_debug"] ? yaml["nms_debug"].as<bool>() : false;
+
+  confidence_threshold_ = std::clamp(confidence_threshold_, 0.0f, 1.0f);
+  iou_threshold_ = std::clamp(iou_threshold_, 0.0f, 1.0f);
+  nms_center_gate_ratio_ = std::clamp(nms_center_gate_ratio_, 0.0f, 1.0f);
+  nms_top_k_ = std::max(1, nms_top_k_);
+
   model = core.read_model(model_path);
   // printInputAndOutputsInfo(*model);  // 打印模型信息
   /// 载入并编译模型
@@ -43,6 +90,12 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_multicandidateboxes(cv::Mat & 
   const float * output_buffer = output.data<const float>();
   const int out_rows = output_shape[1];  // 获得"output"节点的rows 15
   const int out_cols = output_shape[2];  // 获得"output"节点的cols 8400
+  if (out_rows < 5 + NUM_POINTS * 2) {
+    tools::logger()->warn(
+      "[YOLO11_BUFF] Unexpected output shape: rows={}, cols={}, need_rows>={}", out_rows, out_cols,
+      5 + NUM_POINTS * 2);
+    return std::vector<YOLO11_BUFF::Object>();
+  }
   const cv::Mat det_output(
     out_rows, out_cols, CV_32F, (float *)output_buffer);  // output_buff类型转换
   std::vector<cv::Rect> boxes;                            // 目标框
@@ -52,7 +105,7 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_multicandidateboxes(cv::Mat & 
   for (int i = 0; i < det_output.cols; ++i) {
     const float score = det_output.at<float>(4, i);
     // 如果置信度满足条件则放进vector
-    if (score > ConfidenceThreshold) {
+    if (score > confidence_threshold_) {
       // 获取目标框
       const float cx = det_output.at<float>(0, i);
       const float cy = det_output.at<float>(1, i);
@@ -64,6 +117,9 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_multicandidateboxes(cv::Mat & 
       box.y = static_cast<int>((cy - 0.5f * oh - pad_y) * factor);
       box.width = static_cast<int>(ow * factor);
       box.height = static_cast<int>(oh * factor);
+
+      box = clamp_rect(box, image.size());
+      if (box.width <= 1 || box.height <= 1) continue;
       boxes.push_back(box);
 
       // 获取置信度
@@ -84,9 +140,64 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_multicandidateboxes(cv::Mat & 
     }
   }
 
-  /// NMS,消除具有较低置信度的冗余重叠框,用于处理多个框的情况
+  // Center-distance-aware NMS:
+  // - If two boxes overlap heavily (IoU > iou_threshold_) *and* their centers are close,
+  //   treat them as duplicates and suppress the lower-score one.
+  // - If their centers are sufficiently separated, keep both (handles two close targets).
+  std::vector<int> order(boxes.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&](int a, int b) { return confidences[a] > confidences[b]; });
+
+  auto candidate_center = [&](int idx) -> cv::Point2f {
+    if (idx >= 0 && idx < static_cast<int>(objects_keypoints.size())) {
+      const auto & kpts = objects_keypoints[idx];
+      // Prefer the model's designated center keypoint (index 4) if present.
+      const size_t center_off = 4 * 2;
+      if (kpts.size() > center_off + 1) {
+        return {kpts[center_off + 0], kpts[center_off + 1]};
+      }
+    }
+    return rect_center(boxes[idx]);
+  };
+
   std::vector<int> indexes;
-  cv::dnn::NMSBoxes(boxes, confidences, ConfidenceThreshold, IouThreshold, indexes);
+  indexes.reserve(std::min(static_cast<size_t>(nms_top_k_), order.size()));
+  float max_suppressed_iou = 0.0f;
+  for (int idx : order) {
+    bool keep = true;
+    const cv::Rect & box = boxes[idx];
+    const cv::Point2f c = candidate_center(idx);
+
+    for (int kept_idx : indexes) {
+      const cv::Rect & kept_box = boxes[kept_idx];
+      const float iou = rect_iou(box, kept_box);
+      if (iou <= iou_threshold_) continue;
+
+      const cv::Point2f ck = candidate_center(kept_idx);
+      const float center_dist = cv::norm(c - ck);
+      const float min_size = static_cast<float>(
+        std::min({box.width, box.height, kept_box.width, kept_box.height}));
+      const float gate = std::max(5.0f, nms_center_gate_ratio_ * min_size);
+
+      if (center_dist < gate) {
+        keep = false;
+        max_suppressed_iou = std::max(max_suppressed_iou, iou);
+        break;
+      }
+    }
+
+    if (keep) {
+      indexes.push_back(idx);
+      if (static_cast<int>(indexes.size()) >= nms_top_k_) break;
+    }
+  }
+
+  if (nms_debug_) {
+    tools::logger()->debug(
+      "[YOLO11_BUFF] NMS: candidates={}, kept={}, conf_th={:.2f}, iou_th={:.2f}, gate_ratio={:.2f}, max_supp_iou={:.2f}",
+      boxes.size(), indexes.size(), confidence_threshold_, iou_threshold_, nms_center_gate_ratio_,
+      max_suppressed_iou);
+  }
 
   std::vector<Object> object_result;  // 最终得到的object
   for (size_t i = 0; i < indexes.size(); ++i) {
@@ -121,7 +232,7 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_multicandidateboxes(cv::Mat & 
   /// 计算FPS
   const float t = (cv::getTickCount() - start) / static_cast<float>(cv::getTickFrequency());
   cv::putText(
-    image, cv::format("FPS: %.2f", 1.0 / t), cv::Point(20, 40), cv::FONT_HERSHEY_PLAIN, 2.0,
+    image, cv::format("FPS: %.2f", 1.0 / std::max(t, 1e-6f)), cv::Point(20, 40), cv::FONT_HERSHEY_PLAIN, 2.0,
     cv::Scalar(255, 0, 0), 2, 8);
 
   // #ifdef SAVE
@@ -133,6 +244,11 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_multicandidateboxes(cv::Mat & 
 std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_onecandidatebox(cv::Mat & image)
 {
   const int64 start = cv::getTickCount();  // 设置模型输入
+
+  if (image.empty()) {
+    tools::logger()->warn("Empty img!, camera drop!");
+    return std::vector<YOLO11_BUFF::Object>();
+  }
 
   /// 预处理
   float pad_x = 0.0f;
@@ -150,6 +266,12 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_onecandidatebox(cv::Mat & imag
   const float * output_buffer = output.data<const float>();
   const int out_rows = output_shape[1];  // 获得"output"节点的rows 17
   const int out_cols = output_shape[2];  // 获得"output"节点的cols 8400
+  if (out_rows < 5 + NUM_POINTS * 2) {
+    tools::logger()->warn(
+      "[YOLO11_BUFF] Unexpected output shape: rows={}, cols={}, need_rows>={}", out_rows, out_cols,
+      5 + NUM_POINTS * 2);
+    return std::vector<YOLO11_BUFF::Object>();
+  }
   const cv::Mat det_output(
     out_rows, out_cols, CV_32F, (float *)output_buffer);  // output_buff类型转换
 
@@ -165,7 +287,7 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_onecandidatebox(cv::Mat & imag
     }
   }
   std::vector<Object> object_result;  // 最终得到的object
-  if (max_confidence > ConfidenceThreshold) {
+  if (best_index >= 0 && max_confidence > confidence_threshold_) {
     Object obj;
     // 获取目标框
     const float cx = det_output.at<float>(0, best_index);
@@ -176,6 +298,9 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_onecandidatebox(cv::Mat & imag
     obj.rect.y = static_cast<int>((cy - 0.5f * oh - pad_y) * factor);
     obj.rect.width = static_cast<int>(ow * factor);
     obj.rect.height = static_cast<int>(oh * factor);
+
+    obj.rect = clamp_rect(obj.rect, image.size());
+    if (obj.rect.width <= 1 || obj.rect.height <= 1) return std::vector<YOLO11_BUFF::Object>();
     // 获取置信度
     obj.prob = max_confidence;
     // 获取关键点
@@ -213,7 +338,7 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_onecandidatebox(cv::Mat & imag
   /// 计算FPS
   const float t = (cv::getTickCount() - start) / static_cast<float>(cv::getTickFrequency());
   cv::putText(
-    image, cv::format("FPS: %.2f", 1.0 / t), cv::Point(20, 40), cv::FONT_HERSHEY_PLAIN, 2.0,
+    image, cv::format("FPS: %.2f", 1.0 / std::max(t, 1e-6f)), cv::Point(20, 40), cv::FONT_HERSHEY_PLAIN, 2.0,
     cv::Scalar(255, 0, 0), 2, 8);
   return object_result;
 }

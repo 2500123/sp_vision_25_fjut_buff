@@ -74,22 +74,51 @@ std::string Gimbal::str(GimbalMode mode) const
 
 Eigen::Quaterniond Gimbal::q(std::chrono::steady_clock::time_point t)
 {
-  while (true) {
-    auto [q_a, t_a] = queue_.pop();
-    auto [q_b, t_b] = queue_.front();
-    auto t_ab = tools::delta_time(t_a, t_b);
-    auto t_ac = tools::delta_time(t_a, t);
-    auto k = t_ac / t_ab;
-    Eigen::Quaterniond q_c = q_a.slerp(k, q_b).normalized();
-    if (t < t_a) return q_c;
-    if (!(t_a < t && t <= t_b)) continue;
-
-    return q_c;
+  // Prefer cached samples (non-blocking). If we don't have enough data, fall back to last known q.
+  Eigen::Quaterniond q0, q1;
+  std::chrono::steady_clock::time_point t0, t1;
+  bool has0 = false;
+  bool has1 = false;
+  {
+    std::lock_guard<std::mutex> lock(q_mutex_);
+    has1 = has_last_q_;
+    has0 = has_prev_q_;
+    q1 = last_q_;
+    t1 = last_q_time_;
+    q0 = prev_q_;
+    t0 = prev_q_time_;
   }
+
+  if (!has1) {
+    return Eigen::Quaterniond(1.0, 0.0, 0.0, 0.0);
+  }
+  if (!has0) {
+    return q1;
+  }
+
+  // If the requested timestamp is outside the cached interval, just return the nearest.
+  if (t <= t0) return q0;
+  if (t >= t1) return q1;
+
+  const double dt01 = tools::delta_time(t0, t1);
+  if (std::abs(dt01) < 1e-6) return q1;
+
+  const double dt0t = tools::delta_time(t0, t);
+  const double k = std::clamp(dt0t / dt01, 0.0, 1.0);
+  return q0.slerp(k, q1).normalized();
+}
+
+double Gimbal::q_age_ms(std::chrono::steady_clock::time_point now) const
+{
+  std::lock_guard<std::mutex> lock(q_mutex_);
+  if (!has_last_q_) return std::numeric_limits<double>::infinity();
+  return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - last_q_time_)
+    .count();
 }
 
 void Gimbal::send(io::VisionToGimbal VisionToGimbal)
 {
+  std::lock_guard<std::mutex> lock(tx_mutex_);
   tx_data_.mode = VisionToGimbal.mode;
   tx_data_.yaw = VisionToGimbal.yaw;
   tx_data_.yaw_vel = VisionToGimbal.yaw_vel;
@@ -111,6 +140,7 @@ void Gimbal::send(
   bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel,
   float pitch_acc)
 {
+  std::lock_guard<std::mutex> lock(tx_mutex_);
   tx_data_.mode = control ? (fire ? 2 : 1) : 0;
   tx_data_.yaw = yaw;
   tx_data_.yaw_vel = yaw_vel;
@@ -218,6 +248,19 @@ void Gimbal::read_thread()
     error_count = 0;
     frame_synced = false;  // 重置帧同步标志，为下一帧做准备
     Eigen::Quaterniond q(rx_data_.q[0], rx_data_.q[1], rx_data_.q[2], rx_data_.q[3]);
+
+    {
+      std::lock_guard<std::mutex> q_lock(q_mutex_);
+      if (has_last_q_) {
+        prev_q_ = last_q_;
+        prev_q_time_ = last_q_time_;
+        has_prev_q_ = true;
+      }
+      last_q_ = q;
+      last_q_time_ = t;
+      has_last_q_ = true;
+    }
+
     queue_.push({q, t});
 
     std::lock_guard<std::mutex> lock(mutex_);

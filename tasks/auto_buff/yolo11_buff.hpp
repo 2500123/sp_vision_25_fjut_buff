@@ -2,6 +2,7 @@
 #define AUTO_BUFF__YOLO11_BUFF_HPP
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <opencv2/opencv.hpp>
 #include <openvino/openvino.hpp>
@@ -38,6 +39,12 @@ private:
   ov::InferRequest infer_request;
   ov::Tensor input_tensor;
   const int NUM_POINTS = 6;
+
+  float confidence_threshold_{0.4f};
+  float iou_threshold_{0.6f};
+  float nms_center_gate_ratio_{0.25f};
+  int nms_top_k_{50};
+  bool nms_debug_{false};
 
   // 转换图像数据: 先转换元素类型, (可选)然后归一化到[0, 1], (可选)然后交换RB通道
   void convert(

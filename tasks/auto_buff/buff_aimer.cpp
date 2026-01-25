@@ -33,8 +33,6 @@ io::Command Aimer::aim(
   auto future = to_now ? (detect_now_gap + predict_time_) : 0.1 + predict_time_;
   double yaw, pitch;
 
-  bool angle_changed =
-    std::abs(last_yaw_ - yaw) > 5 / 57.3 || std::abs(last_pitch_ - pitch) > 5 / 57.3;
   if (get_send_angle(target, future, bullet_speed, to_now, yaw, pitch)) {
     command.yaw = yaw;
     command.pitch = -pitch;  //世界坐标系下的pitch向上为负
@@ -86,8 +84,6 @@ auto_aim::Plan Aimer::mpc_aim(
   auto future = to_now ? (detect_now_gap + predict_time_) : 0.1 + predict_time_;
   double yaw, pitch;
 
-  bool angle_changed =
-    std::abs(last_yaw_ - yaw) > 5 / 57.3 || std::abs(last_pitch_ - pitch) > 5 / 57.3;
   if (get_send_angle(target, future, bullet_speed, to_now, yaw, pitch)) {
     plan.yaw = yaw;
     plan.pitch = -pitch;  //世界坐标系下的pitch向上为负

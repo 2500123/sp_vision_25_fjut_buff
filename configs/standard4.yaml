@@ -94,6 +94,12 @@ R_pitch: [1]
 #####-----buff_detector参数-----#####
 model: "assets/yolo11_buff_int8.xml"
 
+confidence_threshold: 0.4
+iou_threshold: 0.8
+nms_center_gate_ratio: 0.1 #框中心距离
+nms_top_k: 30  #NMS 最多保留的候选框数量上限
+nms_debug: false
+
 #####-----buff_aimer参数-----#####
 fire_gap_time: 0.520   # s，射击间隔时间
 predict_time: 0.100     # s
